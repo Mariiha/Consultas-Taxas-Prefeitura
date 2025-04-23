@@ -1,0 +1,166 @@
+import asyncio
+import base64
+import os
+import time
+from dotenv import load_dotenv
+from playwright.async_api import async_playwright, expect
+import requests
+
+load_dotenv()
+
+MODO_TESTE = True
+EXECUTABLE_PATH = "C:/Program Files/Google/Chrome/Application/chrome.exe"
+
+def resolver_captcha_2captcha(image_base64, api_key):
+    url = "http://2captcha.com/in.php"
+    data = {'method': 'base64', 'key': api_key, 'body': image_base64, 'json': 1}
+    response = requests.post(url, data=data).json()
+    if response.get("status") != 1:
+        raise Exception("Erro ao enviar captcha")
+    captcha_id = response["request"]
+    for _ in range(20):
+        time.sleep(5)
+        res = requests.get(f"http://2captcha.com/res.php?key={api_key}&action=get&id={captcha_id}&json=1").json()
+        if res.get("status") == 1:
+            return res["request"]
+    raise Exception("Timeout na resolução do captcha")
+
+def interpretar_parcelas(texto):
+    texto = texto.strip().lower()
+    if texto in ("única", "0", "0,1"):
+        return "Em Aberto"
+    if "a" in texto:
+        partes = texto.split("a", 1)
+        if len(partes) < 2 or not partes[0].isdigit() or not partes[1].isdigit():
+            return "Em Aberto"
+        ini, fim = map(int, partes)
+        abertas = fim - ini + 1
+        total = fim
+    elif "," in texto:
+        parcelas = [int(p.strip()) for p in texto.split(",") if p.strip().isdigit()]
+        if not parcelas:
+            return "Em Aberto"
+        abertas = len(parcelas)
+        total = max(parcelas)
+    elif texto.isdigit():
+        abertas = 1
+        total = int(texto)
+    else:
+        return "Em Aberto"
+    pagas = total - abertas
+    return f"{pagas}/{total}"
+
+async def realizar_login(page, usuario, senha, api_key):
+    await page.goto("https://portaldocidadao.anapolis.go.gov.br/")
+    await page.fill('input[id="101817"]', usuario)
+    await page.fill('input[id="101818"]', senha)
+    if MODO_TESTE:
+        print("🧩 MODO TESTE ATIVADO: Resolva o CAPTCHA manualmente no navegador.")
+        input("✅ Quando terminar, clique em 'Acessar' no site e depois aperte ENTER aqui para continuar...")
+    else:
+        captcha_bytes = await page.locator("img.step-img").screenshot()
+        captcha_img = base64.b64encode(captcha_bytes).decode("utf-8")
+        resposta = resolver_captcha_2captcha(captcha_img, api_key)
+        await page.fill('input[id="101819"]', resposta)
+        await page.click('input[id="101822"]')
+    print("Login realizado com sucesso.")
+
+async def consultar_cnpj(page, cnpj):
+    await page.hover("a.pure-menu-link:text('Consultar')")
+    await page.click("a[data-navigation='20206']")
+    await page.wait_for_selector("input.tablesorter-filter[data-column='4']", timeout=10000)
+    await page.fill("input.tablesorter-filter[data-column='4']", cnpj)
+    await page.keyboard.press("Enter")
+    print(f"CNPJ {cnpj} preenchido. Aguardando atualização da tabela...")
+    await page.wait_for_selector("#grid67248")
+    xpath = f"//tr[td//div[contains(text(), '{cnpj}')]]//input[@type='radio']"
+    checkbox = page.locator(xpath)
+    await expect(checkbox).to_be_visible(timeout=10000)
+    await checkbox.check()
+    print(f"Cliente encontrado e selecionado para o CNPJ {cnpj}.")
+    await page.wait_for_selector('input[id="67252"]', timeout=10000)
+    await page.click('input[id="67252"]')
+    await page.wait_for_timeout(3000)
+    if await page.locator("text=A inscrição informada não possui nenhum débito no momento").is_visible():
+        print("Cliente está regular. Nenhum débito encontrado.")
+        return []
+    return await extrair_taxas_detalhadas(page)
+
+async def extrair_taxas_detalhadas(page):
+    taxas_total = []
+    engrenagens = await page.locator("button.nfe-action").all()
+    for idx, engrenagem in enumerate(engrenagens):
+        print(f"🛠️ Clicando em 'Detalhar' ({idx + 1}/{len(engrenagens)})...")
+        await engrenagem.click()
+        await page.wait_for_selector(".fg-menu-container", state="visible", timeout=5000)
+        await page.evaluate("document.querySelectorAll(\"a[data-op='DETALHA_DIVIDA']\")[0].click()")
+        print("⏳ Aguardando carregamento da tabela detalhada...")
+        await page.locator("tr.jqgrow td[aria-describedby*='Tributo']").first.wait_for(state="attached", timeout=15000)
+        print("✅ Tabela detalhada carregada.")
+        taxas = await extrair_taxas(page)
+        taxas_total.extend(taxas)
+    return taxas_total
+
+async def extrair_taxas(page):
+    await page.wait_for_selector("table.jqgrid tbody tr.jqgrow", timeout=10000)
+    linhas = await page.locator("table.jqgrid tbody tr").all()
+    exercicio_atual = None
+    taxas_resultado = []
+    for linha in linhas:
+        classes = await linha.get_attribute("class") or ""
+        if "jqgroup" in classes:
+            texto = await linha.inner_text()
+            if "Exercício:" in texto:
+                exercicio_atual = texto.split("Exercício:")[-1].strip()
+            continue
+        if "jqgrow" not in classes:
+            continue
+        colunas = await linha.locator("td").all_text_contents()
+        if len(colunas) < 6:
+            continue
+        nome_taxa = colunas[3].strip()
+        parcelas = colunas[5].strip()
+        status = interpretar_parcelas(parcelas)
+        resultado = status if status != "Em Aberto" else f"{exercicio_atual} em aberto" if exercicio_atual != "2025" else "Em Aberto"
+        taxas_resultado.append({
+            "exercicio": exercicio_atual,
+            "nome": nome_taxa,
+            "parcelas": parcelas,
+            "resultado": resultado
+        })
+    print("Taxas extraídas:")
+    for taxa in taxas_resultado:
+        print(f" → [{taxa['exercicio']}] {taxa['nome']} – {taxa['resultado']}")
+    return taxas_resultado
+
+async def main(cnpjs, usuario, senha, api_key):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False, executable_path=EXECUTABLE_PATH)
+        context = await browser.new_context(ignore_https_errors=True)
+        page = await context.new_page()
+        await realizar_login(page, usuario, senha, api_key)
+        for cnpj in cnpjs:
+            print(f"🔁 Iniciando consulta para {cnpj}...")
+            try:
+                await consultar_cnpj(page, cnpj)
+                print(f"Consulta finalizada para {cnpj}.")
+            except Exception as e:
+                print(f"⚠️ Erro ao consultar {cnpj}: {e}")
+        print("🔚 Finalizando navegação...")
+        await context.close()
+        await browser.close()
+
+if __name__ == "__main__":
+    USUARIO = os.getenv("USUARIO")
+    SENHA = os.getenv("SENHA")
+    API_KEY = os.getenv("API_KEY_2CAPTCHA")
+    CNPJS = [
+        "29.413.500/0001-37",
+        "49.763.344/0001-41"
+    ]
+    print("Variáveis carregadas:")
+    print("USUARIO:", USUARIO)
+    print("SENHA:", "****" if SENHA else None)
+    print("API_KEY:", API_KEY[:4] + "..." if API_KEY else None)
+    asyncio.run(main(CNPJS, USUARIO, SENHA, API_KEY))
+    print("✅ Script finalizado com sucesso.")
