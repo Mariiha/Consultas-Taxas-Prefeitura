@@ -1,9 +1,7 @@
 import asyncio
 import base64
 import json
-import logging
 import os
-import re
 import time
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, expect
@@ -103,9 +101,8 @@ async def extrair_taxas_detalhadas(page, cnpj):
     for idx, engrenagem in enumerate(engrenagens):
         print(f"🛠️ Clicando em 'Detalhar' ({idx + 1}/{len(engrenagens)})...")
         await engrenagem.click()
-        detalhar = page.locator(f"a[data-op='DETALHA_DIVIDA'][data-key='{idx + 1}']:visible")
-        await detalhar.wait_for(timeout=5000)
-        await detalhar.click()
+        detalhar = page.locator(f".fg-menu-container a[data-op='DETALHA_DIVIDA'][data-key='{idx + 1}']")
+        await detalhar.first.click()
         print("⏳ Aguardando carregamento da tabela detalhada...")
         await page.locator("tr.jqgrow td[aria-describedby*='Tributo']").first.wait_for(state="attached", timeout=15000)
         print("✅ Tabela detalhada carregada.")
