@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import json
 import os
 import time
 from dotenv import load_dotenv
@@ -93,18 +92,18 @@ async def consultar_cnpj(page, cnpj):
     if await page.locator("text=A inscrição informada não possui nenhum débito no momento").is_visible():
         print("Cliente está regular. Nenhum débito encontrado.")
         return []
-    return await extrair_taxas_detalhadas(page, cnpj)
+    return await extrair_taxas_detalhadas(page)
 
-async def extrair_taxas_detalhadas(page, cnpj):
+async def extrair_taxas_detalhadas(page):
     taxas_total = []
     engrenagens = await page.locator("button.nfe-action").all()
     for idx, engrenagem in enumerate(engrenagens):
         print(f"🛠️ Clicando em 'Detalhar' ({idx + 1}/{len(engrenagens)})...")
         await engrenagem.click()
         detalhar = page.locator(f".fg-menu-container a[data-op='DETALHA_DIVIDA'][data-key='{idx + 1}']")
-        await detalhar.first.click()
+        await detalhar.click()
         print("⏳ Aguardando carregamento da tabela detalhada...")
-        await page.locator("tr.jqgrow td[aria-describedby*='Tributo']").first.wait_for(state="attached", timeout=15000)
+        await page.wait_for_function("document.querySelectorAll('tr.jqgrow').length > 0", timeout=10000)
         print("✅ Tabela detalhada carregada.")
         taxas = await extrair_taxas(page)
         taxas_total.extend(taxas)
@@ -116,22 +115,18 @@ async def extrair_taxas(page):
     exercicio_atual = None
     taxas_resultado = []
     for linha in linhas:
-        classes = await linha.get_attribute("class") or ""
-        if "jqgroup" in classes:
-            texto = await linha.inner_text()
-            if "Exercício:" in texto:
-                exercicio_atual = texto.split("Exercício:")[-1].strip()
-            continue
-        if "jqgrow" not in classes:
-            continue
         colunas = await linha.locator("td").all_text_contents()
         if len(colunas) < 6:
             continue
-        nome_taxa = colunas[3].strip()
-        if not nome_taxa:
+        if colunas[3].strip() == '' or colunas[3].strip().startswith('R$'):
             continue
+        nome_taxa = colunas[3].strip()
         parcelas = colunas[5].strip()
         status = interpretar_parcelas(parcelas)
+        if "jqgroup" in (await linha.get_attribute("class") or ""):
+            texto = await linha.inner_text()
+            if "Exercício:" in texto:
+                exercicio_atual = texto.split("Exercício:")[-1].strip()
         resultado = status if status != "Em Aberto" else f"{exercicio_atual} em aberto" if exercicio_atual != "2025" else "Em Aberto"
         taxas_resultado.append({
             "exercicio": exercicio_atual,
