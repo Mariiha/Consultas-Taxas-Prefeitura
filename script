@@ -1,6 +1,9 @@
 import asyncio
 import base64
+import json
+import logging
 import os
+import re
 import time
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, expect
@@ -10,6 +13,14 @@ load_dotenv()
 
 MODO_TESTE = True
 EXECUTABLE_PATH = "C:/Program Files/Google/Chrome/Application/chrome.exe"
+
+def carregar_variaveis_ambiente():
+    usuario = os.getenv("USUARIO")
+    senha = os.getenv("SENHA")
+    api_key = os.getenv("API_KEY_2CAPTCHA")
+    if not usuario or not senha or not api_key:
+        raise ValueError("ERRO: Verifique se USUARIO, SENHA e API_KEY_2CAPTCHA estão corretamente definidos no .env")
+    return usuario, senha, api_key
 
 def resolver_captcha_2captcha(image_base64, api_key):
     url = "http://2captcha.com/in.php"
@@ -84,16 +95,17 @@ async def consultar_cnpj(page, cnpj):
     if await page.locator("text=A inscrição informada não possui nenhum débito no momento").is_visible():
         print("Cliente está regular. Nenhum débito encontrado.")
         return []
-    return await extrair_taxas_detalhadas(page)
+    return await extrair_taxas_detalhadas(page, cnpj)
 
-async def extrair_taxas_detalhadas(page):
+async def extrair_taxas_detalhadas(page, cnpj):
     taxas_total = []
     engrenagens = await page.locator("button.nfe-action").all()
     for idx, engrenagem in enumerate(engrenagens):
         print(f"🛠️ Clicando em 'Detalhar' ({idx + 1}/{len(engrenagens)})...")
         await engrenagem.click()
-        await page.wait_for_selector(".fg-menu-container", state="visible", timeout=5000)
-        await page.evaluate("document.querySelectorAll(\"a[data-op='DETALHA_DIVIDA']\")[0].click()")
+        detalhar = page.locator(f"a[data-op='DETALHA_DIVIDA'][data-key='{idx + 1}']:visible")
+        await detalhar.wait_for(timeout=5000)
+        await detalhar.click()
         print("⏳ Aguardando carregamento da tabela detalhada...")
         await page.locator("tr.jqgrow td[aria-describedby*='Tributo']").first.wait_for(state="attached", timeout=15000)
         print("✅ Tabela detalhada carregada.")
@@ -119,6 +131,8 @@ async def extrair_taxas(page):
         if len(colunas) < 6:
             continue
         nome_taxa = colunas[3].strip()
+        if not nome_taxa:
+            continue
         parcelas = colunas[5].strip()
         status = interpretar_parcelas(parcelas)
         resultado = status if status != "Em Aberto" else f"{exercicio_atual} em aberto" if exercicio_atual != "2025" else "Em Aberto"
@@ -142,7 +156,7 @@ async def main(cnpjs, usuario, senha, api_key):
         for cnpj in cnpjs:
             print(f"🔁 Iniciando consulta para {cnpj}...")
             try:
-                await consultar_cnpj(page, cnpj)
+                taxas = await consultar_cnpj(page, cnpj)
                 print(f"Consulta finalizada para {cnpj}.")
             except Exception as e:
                 print(f"⚠️ Erro ao consultar {cnpj}: {e}")
@@ -151,9 +165,7 @@ async def main(cnpjs, usuario, senha, api_key):
         await browser.close()
 
 if __name__ == "__main__":
-    USUARIO = os.getenv("USUARIO")
-    SENHA = os.getenv("SENHA")
-    API_KEY = os.getenv("API_KEY_2CAPTCHA")
+    USUARIO, SENHA, API_KEY = carregar_variaveis_ambiente()
     CNPJS = [
         "29.413.500/0001-37",
         "49.763.344/0001-41"
